@@ -1,0 +1,66 @@
+{
+  "data": {
+    "telemetry_root": "E:\\pp-test\\test\\Telemetry",
+    "feature_set": "full",
+    "require_fired": true,
+    "label_column": "label_cheating"
+  },
+  "window": {
+    "pre": 64,
+    "post": 16,
+    "anchors": [
+      "shot"
+    ],
+    "min_gap": 10,
+    "stride": 25
+  },
+  "split": {
+    "train": 0.6,
+    "val": 0.2,
+    "test": 0.2,
+    "seed": 42
+  },
+  "model": {
+    "arch": "transformer",
+    "hidden": 128,
+    "layers": 2,
+    "dropout": 0.2,
+    "bidirectional": true,
+    "pooling": "attention",
+    "d_model": 128,
+    "n_heads": 4,
+    "ff_dim": 256
+  },
+  "train": {
+    "epochs": 40,
+    "batch_size": 128,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "patience": 8,
+    "pos_weight": "auto",
+    "num_workers": 0,
+    "device": "auto",
+    "seed": 42
+  },
+  "eval": {
+    "threshold": 0.5,
+    "recall_targets": [
+      0.8,
+      0.9,
+      0.95
+    ],
+    "fpr_targets": [
+      0.05,
+      0.01,
+      0.001
+    ],
+    "prevalences": [
+      0.5,
+      0.1,
+      0.05,
+      0.01
+    ],
+    "topk": 3
+  }
+}
