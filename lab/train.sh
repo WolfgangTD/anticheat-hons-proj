@@ -1,45 +1,52 @@
-#!/usr/bin/env bash
-# Train the detector on a lab GPU machine.
+#!/bin/bash
+# Train the detector on the UTS eResearch HPC (PBS Pro). Submit from the repo root:
 #
-#   bash lab/train.sh DATA_DIR RUN_NAME [extra `anticheat train` flags...]
-#   sbatch lab/train.sh DATA_DIR RUN_NAME [...]     # if the lab turns out to use SLURM
+#   qsub -v DATA=$HOME/telemetry,RUN=hybrid-5h lab/train.sh
 #
-# DATA_DIR holds the session_* folders. Output goes to runs/RUN_NAME, including
-# train.log. Built windows are cached in cache/ and reused by every later run on the
-# same data, so only the first run pays for reading the CSVs.
+# DATA is the folder in your home directory holding the session_* folders; RUN names
+# the output folder, runs/RUN. Extra `anticheat train` flags go in EXTRA and win over
+# the defaults below, for example a second seed:
 #
-# Re-running the same command after the job was killed (queue time limit, lost SSH
-# session) resumes from the last finished epoch instead of starting over.
+#   qsub -v DATA=$HOME/telemetry,RUN=hybrid-5h-seed2,EXTRA="--seed 2" lab/train.sh
 #
-# The #SBATCH lines are plain comments to bash. Under SLURM they request one GPU; adjust
-# them to whatever the lab's queue allows once that is known.
-#SBATCH --job-name=anticheat
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
-#SBATCH --time=12:00:00
-#SBATCH --output=anticheat-%j.log
+# The capture is copied to the node's local /scratch and the windows are cached there,
+# as the HPC asks for large files. Results are small and are written straight to
+# runs/RUN in home, so nothing needs copying back, and a job killed at its walltime
+# loses at most one epoch: submit the same command again and it resumes.
+#
+# Memory: the first pass over the CSVs peaks at about 3 GB per hour of capture, plus a
+# few GB. 32GB covers roughly 9 hours of capture; raise mem for a longer one.
+#PBS -N anticheat
+#PBS -q gpuq
+#PBS -l ngpus=1
+#PBS -l ncpus=4
+#PBS -l mem=32GB
+#PBS -l walltime=04:00:00
+# For an email when the job starts and ends, remove one # from each line and fill in:
+##PBS -m abe
+##PBS -M your.email@student.uts.edu.au
 set -euo pipefail
 
-DATA=${1:?usage: lab/train.sh DATA_DIR RUN_NAME [flags...]}
-RUN=${2:?usage: lab/train.sh DATA_DIR RUN_NAME [flags...]}
-shift 2
+: "${DATA:?pass DATA, e.g. qsub -v DATA=\$HOME/telemetry,RUN=name lab/train.sh}"
+: "${RUN:?pass RUN, e.g. qsub -v DATA=\$HOME/telemetry,RUN=name lab/train.sh}"
 
-# SLURM runs a copy of this script from its spool directory, so $0 does not point into
-# the repo there; sbatch must be run from the repo root.
-cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
+cd "${PBS_O_WORKDIR:-$(dirname "$0")/..}"
 source .venv/bin/activate
-
 export PYTHONUNBUFFERED=1
-mkdir -p "runs/$RUN"
 
-# Batch 512 keeps a GPU busy where the default 128 suits a CPU. Later flags win, so
-# anything passed after RUN_NAME overrides these.
+# The same path on every submission of this run, so a resumed job's settings match the
+# checkpoint's. Scratch is local to each node, so a resume on another node re-copies.
+WORK="/scratch/${USER}/anticheat/${RUN}"
+mkdir -p "$WORK/telemetry" "runs/$RUN"
+trap 'rm -rf "$WORK"' EXIT
+cp -rp "$DATA"/session_* "$WORK/telemetry/"
+
+# Batch 512 keeps a GPU busy where the default 128 suits a CPU.
 python -m anticheat train \
-    --telemetry "$DATA" \
+    --telemetry "$WORK/telemetry" \
     --out "runs/$RUN" \
-    --cache-dir cache \
+    --cache-dir "$WORK/cache" \
     --resume \
     --epochs 40 \
     --batch-size 512 \
-    "$@" 2>&1 | tee -a "runs/$RUN/train.log"
+    ${EXTRA:-} 2>&1 | tee -a "runs/$RUN/train.log"

@@ -1,8 +1,8 @@
 # Training on the lab machines
 
-The lab has NVIDIA GPUs and around 64 GB of RAM per machine; data and code go up over
-SSH. Replace `USER@HOST` with your lab login. Commands marked **PowerShell** run on your
-own PC; the rest run on the lab machine.
+The UTS eResearch HPC runs PBS Pro, with GPUs in the `gpuq` queue. Data and code go up
+over SSH to your home directory. Replace `USER@HOST` with your HPC login. Commands
+marked **PowerShell** run on your own PC; the rest run on the HPC.
 
 ## 1. Upload the capture
 
@@ -44,47 +44,38 @@ ssh USER@HOST "mkdir -p ~/anticheat && tar -xzf ~/anticheat.tgz -C ~/anticheat"
 
 ## 3. Set up once
 
+On the login node (installing is fine there; training is not):
+
 ```bash
 cd ~/anticheat && bash lab/setup.sh
 ```
 
-It ends by printing the GPU it found.
+The login node has no GPU, so the check at the end saying none is visible is expected.
 
 ## 4. Train
 
-**If you log straight into a machine**, run inside `tmux` so the job survives the SSH
-connection dropping (`Ctrl+B` then `D` to detach, `tmux attach -t train` to come back):
+Submit from the repo root:
 
 ```bash
-tmux new -s train
+cd ~/anticheat && qsub -v DATA=$HOME/telemetry,RUN=hybrid-5h lab/train.sh
 ```
 
-```bash
-cd ~/anticheat && bash lab/train.sh ~/telemetry hybrid-5h
-```
+- `qstat` shows the job (`Q` queued, `R` running); `qdel <job id>` cancels it.
+- Progress goes to `runs/hybrid-5h/train.log` (`tail -f` it). PBS also writes
+  `anticheat.o<id>` and `anticheat.e<id>` where you ran `qsub`; the `.e` file should be
+  empty.
+- `history.json` is rewritten after every epoch with train and validation loss per
+  head, ready to plot.
+- If the job hits its walltime, submit the same command again: it resumes after the
+  last finished epoch.
+- Training ends with the evaluation report, in `runs/hybrid-5h/metrics_test.json`.
+- The resource requests are at the top of `lab/train.sh`. Raise `mem` there if the
+  capture is longer than about 9 hours.
 
-**If the lab uses a SLURM queue**, submit from the repo root instead; check the
-`#SBATCH` lines at the top of `lab/train.sh` against the lab's limits first:
-
-```bash
-cd ~/anticheat && sbatch lab/train.sh ~/telemetry hybrid-5h
-```
-
-Either way:
-
-- Progress goes to `runs/hybrid-5h/train.log` (`tail -f` it). `history.json` is
-  rewritten after every epoch with train and validation loss per head, ready to plot.
-- If the job is killed, run the same command again: it resumes after the last finished
-  epoch.
-- The first run on a capture builds the windows into `cache/`. Every later run on the
-  same data (another seed, more epochs) starts training within seconds.
-- Training ends with the evaluation report, written to `runs/hybrid-5h/metrics_test.json`.
-
-Extra flags go after the run name and override the defaults, for example a second seed
-for error bars:
+Another seed, for error bars:
 
 ```bash
-bash lab/train.sh ~/telemetry hybrid-5h-seed2 --seed 2
+qsub -v DATA=$HOME/telemetry,RUN=hybrid-5h-seed2,EXTRA="--seed 2" lab/train.sh
 ```
 
 ## 5. Bring the results back
