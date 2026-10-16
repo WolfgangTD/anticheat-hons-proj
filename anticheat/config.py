@@ -33,9 +33,17 @@ class DataConfig:
     # if its matching gt_* counter is non-zero; honest episodes are never filtered.
     require_fired: bool = True
 
-    # Sample weighting handles imbalance instead of AntiCheatPT-style augmentation,
-    # so nothing in the training set is a near-duplicate of anything else.
-    label_column: str = "label_cheating"
+    # Label the per-cheat heads per window from activations.csv: a window is positive
+    # only if that cheat fired inside it, and windows from an episode running the cheat
+    # where it did not fire are masked, not called honest. A trigger-bot episode is
+    # mostly the agent's own shots, so labelling every window with the episode's draw
+    # teaches the head that ordinary shots are cheating. The cheating head stays
+    # per-episode either way. Off is for sessions captured before the sidecar existed.
+    window_labels: bool = True
+
+    # Where built windows are kept between runs. Empty builds them in memory every time,
+    # which is fine for a short capture and too slow and too large for a long one.
+    cache_dir: str = ""
 
 
 @dataclass
@@ -81,19 +89,21 @@ class SplitConfig:
 
 @dataclass
 class ModelConfig:
-    arch: str = "lstm"  # lstm | transformer
+    """One model: an LSTM backbone with transformer encoder blocks on its outputs."""
 
+    # LSTM backbone
     hidden: int = 128
     layers: int = 2
-    dropout: float = 0.2
     bidirectional: bool = True
-    pooling: str = "attention"  # attention | mean | max | last
 
-    # Transformer baseline only. Unlike AntiCheatPT, the input is projected up to
-    # d_model rather than the model being squeezed down to the raw feature count.
-    d_model: int = 128
-    n_heads: int = 4
-    ff_dim: int = 256
+    # Transformer encoder over the LSTM's per-tick outputs. Its width is the LSTM's
+    # output width (2 x hidden when bidirectional), so nothing is projected in between,
+    # and that width must divide evenly across the attention heads.
+    encoder_layers: int = 2
+    attn_heads: int = 4
+    ff_dim: int = 512
+
+    dropout: float = 0.2
 
 
 @dataclass

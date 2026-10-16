@@ -1,0 +1,2 @@
+# Shell scripts run on Linux lab machines, where a CR at line end breaks bash.
+*.sh text eol=lf

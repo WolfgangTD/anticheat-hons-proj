@@ -1,9 +1,8 @@
 """Command line entry point.
 
     python -m anticheat inspect
-    python -m anticheat train --out runs/lstm
-    python -m anticheat eval runs/lstm
-    python -m anticheat compare --out runs/compare
+    python -m anticheat train --out runs/hybrid
+    python -m anticheat eval runs/hybrid
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import argparse
 from pathlib import Path
 
 from .config import Config
-from .data import summarise
 from .evaluate import evaluate
 from .train import prepare, train
 from .windows import describe_split
@@ -23,17 +21,21 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--feature-set", choices=["full", "relative"])
     parser.add_argument("--keep-unfired", action="store_true",
                         help="keep cheating episodes whose cheat never actually fired")
+    parser.add_argument("--episode-labels", action="store_true",
+                        help="label the cheat heads per episode, for sessions without activations.csv")
+    parser.add_argument("--cache-dir", help="keep built windows here and reuse them on later runs")
 
     parser.add_argument("--pre", type=int, help="steps before the anchor")
     parser.add_argument("--post", type=int, help="steps after the anchor")
     parser.add_argument("--anchors", nargs="+", choices=["shot", "los_acquire", "damage", "uniform"])
     parser.add_argument("--min-gap", type=int)
 
-    parser.add_argument("--arch", choices=["lstm", "transformer"])
-    parser.add_argument("--hidden", type=int)
-    parser.add_argument("--layers", type=int)
+    parser.add_argument("--hidden", type=int, help="LSTM hidden size per direction")
+    parser.add_argument("--layers", type=int, help="LSTM layers")
+    parser.add_argument("--encoder-layers", type=int, help="transformer encoder layers on the LSTM")
+    parser.add_argument("--attn-heads", type=int, help="attention heads per encoder layer")
+    parser.add_argument("--ff-dim", type=int, help="encoder feed-forward width")
     parser.add_argument("--dropout", type=float)
-    parser.add_argument("--pooling", choices=["attention", "mean", "max", "last"])
 
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -52,6 +54,10 @@ def _config_from(args: argparse.Namespace) -> Config:
         cfg.data.feature_set = args.feature_set
     if args.keep_unfired:
         cfg.data.require_fired = False
+    if args.episode_labels:
+        cfg.data.window_labels = False
+    if args.cache_dir:
+        cfg.data.cache_dir = args.cache_dir
 
     if args.pre is not None:
         cfg.window.pre = args.pre
@@ -62,16 +68,18 @@ def _config_from(args: argparse.Namespace) -> Config:
     if args.min_gap is not None:
         cfg.window.min_gap = args.min_gap
 
-    if args.arch:
-        cfg.model.arch = args.arch
     if args.hidden is not None:
         cfg.model.hidden = args.hidden
     if args.layers is not None:
         cfg.model.layers = args.layers
+    if args.encoder_layers is not None:
+        cfg.model.encoder_layers = args.encoder_layers
+    if args.attn_heads is not None:
+        cfg.model.attn_heads = args.attn_heads
+    if args.ff_dim is not None:
+        cfg.model.ff_dim = args.ff_dim
     if args.dropout is not None:
         cfg.model.dropout = args.dropout
-    if args.pooling:
-        cfg.model.pooling = args.pooling
 
     if args.epochs is not None:
         cfg.train.epochs = args.epochs
@@ -100,22 +108,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p_train = sub.add_parser("train", help="train a detector")
     p_train.add_argument("--out", default="runs/latest", help="output directory")
+    p_train.add_argument("--resume", action="store_true",
+                         help="continue from <out>/last.pt if a previous run there was cut off")
     _add_common(p_train)
 
     p_eval = sub.add_parser("eval", help="score a trained run")
     p_eval.add_argument("run_dir")
     p_eval.add_argument("--split", default="test", choices=["train", "val", "test"])
 
-    p_compare = sub.add_parser("compare", help="train the LSTM and the transformer on identical data")
-    p_compare.add_argument("--out", default="runs/compare")
-    _add_common(p_compare)
-
     args = parser.parse_args(argv)
 
     if args.command == "inspect":
         cfg = _config_from(args)
-        capture, windows, splits = prepare(cfg)
-        print(summarise(capture))
+        summary, windows, splits = prepare(cfg)
+        print(summary)
         print()
         print(f"windows           {len(windows)} x {windows.X.shape[1]} steps x {windows.X.shape[2]} features")
         print(f"features          {', '.join(windows.features)}")
@@ -125,36 +131,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train":
         cfg = _config_from(args)
-        train(cfg, Path(args.out))
+        train(cfg, Path(args.out), resume=args.resume)
         print()
         evaluate(Path(args.out), split="test")
         return 0
 
     if args.command == "eval":
         evaluate(Path(args.run_dir), split=args.split)
-        return 0
-
-    if args.command == "compare":
-        root = Path(args.out)
-        results = {}
-
-        for arch in ("lstm", "transformer"):
-            cfg = _config_from(args)
-            cfg.model.arch = arch
-            print(f"\n{'=' * 70}\n{arch}\n{'=' * 70}")
-            run_dir = root / arch
-            train(cfg, run_dir)
-            print()
-            results[arch] = evaluate(run_dir, split="test")
-
-        print(f"\n{'=' * 70}\nside by side (test split)\n{'=' * 70}")
-        print(f"{'arch':<14} {'AUC':>8} {'AP':>8} {'recall':>8} {'fpr':>8} {'episode AUC':>12}")
-        for arch, report in results.items():
-            w = report["window_level"]
-            c = w["at_threshold"]
-            episode = report["episode_level"]["topk_score"]["roc_auc"]
-            print(f"{arch:<14} {w['roc_auc']:>8.4f} {w['average_precision']:>8.4f} "
-                  f"{c['recall']:>8.4f} {c['fpr']:>8.4f} {episode:>12.4f}")
         return 0
 
     return 1

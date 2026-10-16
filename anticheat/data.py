@@ -20,6 +20,21 @@ GROUP_COLS = ["session", "episode_id", "agent_id"]
 # Both agents of a duel share one trajectory, so they must land in the same fold.
 FOLD_COLS = ["session", "episode_id"]
 
+# The model's outputs, in order. "cheating" is the IDS alarm the evaluation leads with;
+# the other three say which cheat. Multi-label, not multiclass: one agent can run
+# several cheats at once, so each head is its own binary target.
+HEADS = ("cheating", "wallhack", "aimsnap", "triggerbot")
+
+# Per-cheat head -> (severity label, ground-truth activation counter) in episodes.csv.
+CHEAT_COLUMNS = {
+    "wallhack": ("label_wallhack", "gt_wallhack_reveals"),
+    "aimsnap": ("label_aim_snap", "gt_aimsnap_adjustments"),
+    "triggerbot": ("label_trigger_bot", "gt_triggerbot_shots"),
+}
+
+TARGET_COLS = [f"y_{head}" for head in HEADS]
+MASK_COLS = [f"m_{head}" for head in HEADS]
+
 # ShotResult in Weapon.cs: NotReady=0, Miss=1, Hit=2. The writer emits -1 for "no shot".
 SHOT_MISS = 1
 SHOT_HIT = 2
@@ -84,10 +99,23 @@ def feature_columns(cfg: DataConfig) -> list[str]:
     return cols + [PAD_FEATURE]
 
 
+ACTIVATION_COLS = GROUP_COLS + ["decision", "cheat"]
+
+# Identity columns keep integer and string types; every measurement is read as float32,
+# which halves the frame against pandas' float64 default and is what the model consumes.
+KEY_DTYPES = {"session": str, "agent_id": str, "episode_id": np.int64, "arena_id": np.int64, "decision": np.int64}
+
+
+def _read_steps(path: str) -> pd.DataFrame:
+    columns = pd.read_csv(path, nrows=0).columns
+    return pd.read_csv(path, dtype={c: KEY_DTYPES.get(c, np.float32) for c in columns})
+
+
 @dataclass
 class Capture:
     steps: pd.DataFrame
     episodes: pd.DataFrame
+    activations: pd.DataFrame | None  # one row per cheat firing; None with window_labels off
     dropped_groups: int  # step groups with no matching episode row
     filtered_episodes: int  # cheating episodes dropped because the cheat never fired
 
@@ -102,11 +130,26 @@ def load_capture(cfg: DataConfig) -> Capture:
     if not step_files:
         raise FileNotFoundError(f"no session_*/steps.csv under {root}")
 
-    steps = pd.concat([pd.read_csv(f) for f in step_files], ignore_index=True)
+    steps = pd.concat([_read_steps(f) for f in step_files], ignore_index=True)
     episodes = pd.concat([pd.read_csv(f) for f in episode_files], ignore_index=True)
 
     steps["session"] = steps["session"].astype(str)
     episodes["session"] = episodes["session"].astype(str)
+
+    activations = None
+    if cfg.window_labels:
+        session_dirs = [os.path.dirname(f) for f in step_files]
+        missing = [d for d in session_dirs if not os.path.isfile(os.path.join(d, "activations.csv"))]
+        if missing:
+            raise FileNotFoundError(
+                f"window labels need activations.csv, which these sessions predate: {missing}. "
+                "Pass --episode-labels to label every window with its episode's draw instead."
+            )
+        activations = pd.concat(
+            [pd.read_csv(os.path.join(d, "activations.csv"), usecols=ACTIVATION_COLS) for d in session_dirs],
+            ignore_index=True,
+        )
+        activations["session"] = activations["session"].astype(str)
 
     # A run cut off mid-episode leaves steps with no FinishEpisode row. Those windows
     # have no label, so they are dropped rather than guessed at.
@@ -117,11 +160,9 @@ def load_capture(cfg: DataConfig) -> Capture:
 
     filtered = 0
     if cfg.require_fired:
-        fired = (
-            ((episodes["label_wallhack"] > 0) & (episodes["gt_wallhack_reveals"] > 0))
-            | ((episodes["label_aim_snap"] > 0) & (episodes["gt_aimsnap_adjustments"] > 0))
-            | ((episodes["label_trigger_bot"] > 0) & (episodes["gt_triggerbot_shots"] > 0))
-        )
+        fired = pd.Series(False, index=episodes.index)
+        for label, gt in CHEAT_COLUMNS.values():
+            fired |= (episodes[label] > 0) & (episodes[gt] > 0)
         drop = (episodes["label_cheating"] == 1) & ~fired
         filtered = int(drop.sum())
         if filtered:
@@ -132,7 +173,8 @@ def load_capture(cfg: DataConfig) -> Capture:
     steps = steps.sort_values(GROUP_COLS + ["decision"]).reset_index(drop=True)
     steps = engineer(steps)
 
-    return Capture(steps=steps, episodes=episodes, dropped_groups=dropped, filtered_episodes=filtered)
+    return Capture(steps=steps, episodes=episodes, activations=activations,
+                   dropped_groups=dropped, filtered_episodes=filtered)
 
 
 def engineer(steps: pd.DataFrame) -> pd.DataFrame:
@@ -141,9 +183,11 @@ def engineer(steps: pd.DataFrame) -> pd.DataFrame:
     Nothing here consults a label. Angles become sin/cos so that the wrap at +/-180
     is not read as a huge jump, and the cheat tells are made explicit as products
     rather than left for the sequence model to discover from a pilot-sized capture.
+
+    Works in place: on a multi-hour capture a defensive copy of the frame costs gigabytes.
     """
 
-    df = steps.copy()
+    df = steps
     g = df.groupby(GROUP_COLS, sort=False)
 
     yaw = np.deg2rad(df["yaw_deg"].to_numpy())
@@ -183,12 +227,16 @@ def engineer(steps: pd.DataFrame) -> pd.DataFrame:
     df["shot_hit"] = (df["shot_result"] == SHOT_HIT).astype(np.float32)
     df["shot_miss"] = (df["shot_result"] == SHOT_MISS).astype(np.float32)
 
-    df[PAD_FEATURE] = 0.0
+    df[PAD_FEATURE] = np.float32(0.0)
     return df
 
 
-def label_table(episodes: pd.DataFrame) -> pd.DataFrame:
-    """Per-agent-episode labels, indexed for window lookup."""
+def label_table(episodes: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
+    """Per-agent-episode labels, indexed for window lookup.
+
+    Adds a target and a mask column per head. A mask of 0 means the head has no valid
+    target for that episode and is left out of its loss and its metrics.
+    """
 
     cols = GROUP_COLS + [
         "label_cheating",
@@ -202,7 +250,23 @@ def label_table(episodes: pd.DataFrame) -> pd.DataFrame:
         "outcome",
         "decisions",
     ]
-    return episodes[cols].set_index(GROUP_COLS)
+    table = episodes[cols].copy()
+
+    table["y_cheating"] = (table["label_cheating"] == 1).astype(np.float32)
+    table["m_cheating"] = np.float32(1.0)
+
+    for head, (label, gt) in CHEAT_COLUMNS.items():
+        drawn = table[label] > 0
+        table[f"y_{head}"] = drawn.astype(np.float32)
+
+        # The episode-level filter in load_capture only drops cheaters where nothing
+        # fired. In a multi-cheat episode one cheat can fire while another never does;
+        # the episode stays, and only the silent cheat's head is told to ignore it,
+        # rather than being taught either "cheating" or "honest" from no evidence.
+        unfired = drawn & (table[gt] == 0) if cfg.require_fired else pd.Series(False, index=table.index)
+        table[f"m_{head}"] = (~unfired).astype(np.float32)
+
+    return table.set_index(GROUP_COLS)
 
 
 def summarise(capture: Capture) -> str:
@@ -213,6 +277,8 @@ def summarise(capture: Capture) -> str:
         f"steps             {len(steps):,}",
         f"dropped groups    {capture.dropped_groups} (steps with no episode row)",
         f"filtered episodes {capture.filtered_episodes} (cheat drawn but never fired)",
+        "cheat heads       " + ("labelled per window from activations.csv" if capture.activations is not None
+                                else "labelled per episode (--episode-labels)"),
         "",
         "label_cheating    " + str(eps["label_cheating"].value_counts().to_dict()),
         "label_type        " + str(eps["label_type"].value_counts().to_dict()),

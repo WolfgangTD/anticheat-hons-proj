@@ -18,15 +18,11 @@ python -m anticheat inspect
 ```
 
 ```bash
-python -m anticheat train --out runs/lstm
+python -m anticheat train --out runs/hybrid
 ```
 
 ```bash
-python -m anticheat eval runs/lstm --split test
-```
-
-```bash
-python -m anticheat compare --out runs/compare
+python -m anticheat eval runs/hybrid --split test
 ```
 
 `inspect` prints the capture summary, the feature list and the fold sizes without
@@ -39,11 +35,37 @@ training anything — run it first after any new capture.
 | `config.py` | Every knob, as nested dataclasses. Written to `config.json` beside each checkpoint. |
 | `data.py` | Session loading, the steps/episodes join, and feature engineering. |
 | `windows.py` | Event-anchored window extraction and group-aware splits. |
-| `model.py` | `LSTMDetector` (the committed architecture) and `TransformerDetector` (baseline). |
+| `model.py` | `HybridDetector`: the LSTM backbone with transformer encoder blocks on it, four heads. |
 | `train.py` | Standardiser, training loop, early stopping, checkpointing. |
 | `metrics.py` | ROC/PR, FPR-at-recall, base-rate correction — numpy, no sklearn dependency. |
 | `evaluate.py` | The IDS-style report, window level and agent-episode level. |
-| `cli.py` | `inspect` / `train` / `eval` / `compare`. |
+| `cli.py` | `inspect` / `train` / `eval`. |
+
+## The model
+
+One network: transformer technology applied on an LSTM. The two are not alternatives
+and are not compared against each other.
+
+```
+window (80 ticks x 38 features)
+  -> biLSTM, 2 layers                 reads the window tick by tick
+  -> transformer encoder x 2          self-attention + feed-forward over the LSTM's outputs
+  -> attention pooling                one learned weight per tick
+  -> shared trunk -> 4 binary heads   cheating | wallhack | aimsnap | triggerbot
+```
+
+The LSTM carries the short-range dynamics (a snap is a few ticks of angular velocity, a
+trigger pull is the tick a target crosses the cone), and because it is recurrent its
+outputs already encode order, so no positional encoding is added. The encoder lets every
+tick attend to every other, which relates events far apart in the window: line of sight
+opening and the shot that follows it, or aim that kept tracking a target the agent could
+not see. The pooling weights come back from `forward(x, return_attention=True)`, one per
+tick, to be checked against the ticks in `activations.csv` where a cheat actually fired.
+
+**The heads are multi-label, not multiclass.** One agent can run several cheats at
+once, so each head is an independent sigmoid. `cheating` is the IDS alarm the evaluation
+leads with; the other three say which cheat. `label_type = "multi"` is a convenience
+string in the capture, not a class.
 
 ## Design decisions
 
@@ -67,16 +89,32 @@ data honest.
 **Episodes where a cheat was drawn but never fired are dropped by default.** The
 severity draw labels an episode, but a wallhack that never revealed anything produced
 no behaviour to detect, so that episode is a mislabelled positive. `require_fired`
-checks the `gt_*` counters and filters those out; `--keep-unfired` disables it. Real
-datasets cannot do this — it is an advantage of generating the data.
+checks the `gt_*` counters and filters those out; `--keep-unfired` disables it. In a
+multi-cheat episode where one cheat fired and another never did, the episode stays and
+only the silent cheat's head is masked out of the loss and the metrics. Real datasets
+cannot do this — it is an advantage of generating the data.
+
+**The cheat heads are labelled per window, from `activations.csv`.** A window is a
+positive for a cheat only if that cheat fired inside it. Windows from an agent running
+the cheat where it did not fire are masked, neither positive nor negative; agents not
+running it are clean negatives. Episode labels alone fail badly for trigger-bot: it
+fires only on an on-target opportunity, so a trigger-bot episode is mostly the agent's
+own shots, and in the 2026-10-16 capture only 22% of trigger-bot-labelled shot windows
+held a bot firing (10% at severity 0.2-0.4). The bot-fired shots themselves are
+distinctive — 53% land on the tick the target enters the aim cone, against 5% of
+ordinary on-target shots — so the signal is there once the labels point at it. The
+`cheating` head stays per episode, and player-level scoring pools every window against
+the episode's label, since a deployed detector cannot know which windows hold a firing.
+`--episode-labels` restores episode labels for sessions captured before the sidecar.
 
 **Model selection is on average precision, not AUC.** With rare positives AUC stays
 comfortable while precision collapses, and precision is what decides whether an honest
-player gets banned.
+player gets banned. It is the mean over the four heads, so the checkpoint kept cannot
+buy a better alarm by giving up the trigger-bot head.
 
-**The deployment threshold is chosen on validation.** `evaluate` picks the threshold
-that hits 90% recall on the validation split and then applies it to test, rather than
-reading the best operating point off the split being reported.
+**The deployment threshold is chosen on validation.** `evaluate` picks each head's
+threshold to hit 90% recall on the validation split and then applies it to test, rather
+than reading the best operating point off the split being reported.
 
 ## What the evaluation reports
 
@@ -91,12 +129,14 @@ least. The report leads with:
   and alarm rate. AntiCheatPT names single-event judgement as its own main limitation:
   a 3% per-window false-positive rate compounds to roughly a coin flip across a
   20-engagement match. Aggregation is what makes the rate survivable.
-- **Recall by cheat type**, so a headline number cannot hide one cheat being missed
-  entirely.
+- **Every head separately**, plus the alarm's recall by what the agent was running, so a
+  headline number cannot hide one cheat being missed entirely.
+- **Recall by severity** for aimsnap and triggerbot, so the result reads "detects
+  trigger-bot down to severity X". Wallhack is binary by design and has no severity axis.
 
 ## Pilot result
 
-From the three sessions captured 2026-09-06 — 277 agent-episodes, 95k steps, 4,561
+From an earlier single-output LSTM, before the model above, on the three sessions captured 2026-09-06 — 277 agent-episodes, 95k steps, 4,561
 shot-anchored windows, 38 features:
 
 ```
@@ -114,14 +154,12 @@ is the first thing worth chasing with a bigger capture.
 
 ## Next
 
-- Capture at scale, with the policy trained to convergence.
-- `compare` with matched epoch budgets, to settle LSTM vs transformer on this data —
-  the comparison AntiCheatPT never ran.
-- Per-decision cheat-fired labels as a third sidecar, keyed on
-  `(session, episode_id, agent_id, decision)`, to move from episode-level labels to
-  instance-level ones. Labels stay out of the feature stream.
-- Continual learning: add god mode, speed hacking and rapid trigger, then measure
-  whether the detector adapts without forgetting the first three.
+- Capture at scale with the config recorded in `meta.json` (every arena on multi-cheat,
+  trigger-bot severity 0.2-1).
+- Check the pooling attention against `activations.csv`: within a positive window, does
+  the model look at the ticks where the cheat fired?
+- Choose the held-out split (unseen `agent_id`, or by session) before reading any
+  validation number.
 
 ## Reference
 

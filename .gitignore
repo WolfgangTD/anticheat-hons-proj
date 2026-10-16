@@ -4,3 +4,4 @@ __pycache__/
 # (they are thesis 4.3). Only the regenerable weights are excluded, by *.pt below.
 *.pt
 .venv/
+cache/
